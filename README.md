@@ -1,2 +1,2 @@
 # musicplayer
-offline music player
+android music player
