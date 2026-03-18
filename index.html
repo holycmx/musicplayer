@@ -403,6 +403,64 @@
   #sync-dot.active { display: block; background: var(--accent); animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
+  /* ── LYRICS ── */
+  #lyrics-panel {
+    display: none;
+    position: absolute;
+    inset: 0;
+    background: var(--bg);
+    z-index: 5;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #lyrics-panel.visible { display: flex; }
+  #lyrics-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px 10px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  #lyrics-track { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  #btn-lyrics-close {
+    background: none; border: none; color: var(--muted);
+    font-size: 20px; cursor: pointer; padding: 4px 4px 4px 12px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #lyrics-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 24px 40px;
+    overscroll-behavior: contain;
+  }
+  #lyrics-text {
+    font-size: 16px;
+    line-height: 1.9;
+    color: var(--muted);
+    white-space: pre-wrap;
+    font-family: var(--font);
+  }
+  #lyrics-text.loaded { color: var(--text); }
+  #lyrics-status { font-size: 13px; color: var(--muted); font-style: italic; }
+
+  #btn-lyrics {
+    background: none; border: none;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    -webkit-tap-highlight-color: transparent;
+    transition: color 0.15s, border-color 0.15s;
+    align-self: flex-start;
+    margin: 0 0 8px 0;
+  }
+  #btn-lyrics.on { color: var(--accent); border-color: var(--accent2); }
+
   /* ── SCROLLBAR ── */
   ::-webkit-scrollbar { width: 2px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -484,6 +542,17 @@
 
   <!-- NOW PLAYING -->
   <div class="view active" id="view-now">
+    <!-- LYRICS PANEL (overlays now playing) -->
+    <div id="lyrics-panel">
+      <div id="lyrics-header">
+        <span id="lyrics-track">—</span>
+        <button id="btn-lyrics-close">✕</button>
+      </div>
+      <div id="lyrics-body">
+        <div id="lyrics-text"><span id="lyrics-status">No lyrics loaded</span></div>
+      </div>
+    </div>
+
     <div id="art-wrap">
       <canvas id="art-canvas"></canvas>
       <img id="art-img" />
@@ -492,6 +561,7 @@
       <div id="track-title">—</div>
       <div id="track-artist">No track loaded</div>
     </div>
+    <button id="btn-lyrics">lyrics</button>
     <div id="progress-wrap">
       <div id="progress-bar">
         <div id="progress-fill"></div>
@@ -560,8 +630,75 @@
 <div id="toast"></div>
 
 <script>
-const audio = new Audio();
-audio.preload = 'auto';
+// ── AUDIO ENGINE (crossfade)
+const FADE_DURATION = 12; // seconds
+let nodes = [makeNode(), makeNode()];
+let activeNode = 0;
+
+function makeNode() {
+  const a = new Audio();
+  a.preload = 'auto';
+  a.volume = 1;
+  return a;
+}
+
+// Proxy so all existing `audio.x` calls transparently hit the active node
+const audio = new Proxy({}, {
+  get(_, prop) {
+    const node = nodes[activeNode];
+    const val = node[prop];
+    return typeof val === 'function' ? val.bind(node) : val;
+  },
+  set(_, prop, value) {
+    nodes[activeNode][prop] = value;
+    return true;
+  }
+});
+
+// Called instead of audio.src = url + audio.play() when we want a crossfade
+let isCrossfading = false;
+function crossfadeTo(url, onSwapped) {
+  const nextIdx = 1 - activeNode;
+  const outNode = nodes[activeNode];
+  const inNode = nodes[nextIdx];
+
+  inNode.src = url;
+  inNode.volume = 0;
+  inNode.play().catch(() => {});
+
+  isCrossfading = true;
+  let elapsed = 0;
+  const interval = setInterval(() => {
+    elapsed += 0.05;
+    const t = Math.min(elapsed / FADE_DURATION, 1);
+    inNode.volume = t;
+    outNode.volume = 1 - t;
+    if (t >= 1) {
+      clearInterval(interval);
+      outNode.pause();
+      outNode.src = '';
+      outNode.volume = 1;
+      activeNode = nextIdx;
+      isCrossfading = false;
+      // Reattach persistent event listeners to new active node
+      attachNodeListeners(nodes[activeNode]);
+      if (onSwapped) onSwapped();
+    }
+  }, 50);
+}
+
+function attachNodeListeners(node) {
+  // Remove from both nodes first, then add to target
+  nodes.forEach(n => {
+    n.onplay = null; n.onpause = null;
+    n.ontimeupdate = null; n.onloadedmetadata = null; n.onended = null;
+  });
+  node.onplay = onAudioPlay;
+  node.onpause = onAudioPause;
+  node.ontimeupdate = onAudioTimeUpdate;
+  node.onloadedmetadata = onAudioMetadata;
+  node.onended = onAudioEnded;
+}
 
 let allTracks = [];
 let queue = [];
@@ -795,7 +932,11 @@ async function initialScan() {
     if (firstBatch && allTracks.length > 0) {
       firstBatch = false;
       overlay.classList.add('hidden');
-      loadTrack(queue[0]);
+      const firstIdx = queue[0];
+      loadTrack(firstIdx);
+      // Just load into node 0 directly for first track (no crossfade needed)
+      nodes[0].src = allTracks[firstIdx].url;
+      nodes[0].load();
       startSync();
     }
   }
@@ -827,15 +968,11 @@ function buildQueue() {
   queueIdx = 0;
 }
 
-function loadTrack(trackIdx) {
+function loadTrack(trackIdx, startPlaying = false) {
   const t = allTracks[trackIdx];
   if (!t) return;
   queueIdx = queue.indexOf(trackIdx);
   if (queueIdx === -1) { queue.unshift(trackIdx); queueIdx = 0; }
-
-  if (audio.src && audio.src !== t.url) URL.revokeObjectURL(audio.src);
-  audio.src = t.url;
-  audio.load();
 
   trackTitle.textContent = t.title;
   trackArtist.textContent = t.artist + (t.album ? ' · ' + t.album : '');
@@ -858,6 +995,9 @@ function loadTrack(trackIdx) {
 
   document.querySelectorAll('.track-row').forEach(r => r.classList.toggle('playing', +r.dataset.idx === trackIdx));
   renderQueue();
+
+  // Load lyrics if panel is open
+  if (lyricsOpen) fetchLyrics(t);
 }
 
 function drawGenArt(canvas, title) {
@@ -907,53 +1047,59 @@ function togglePlay() {
 }
 btnPlay.addEventListener('click', togglePlay);
 
-audio.addEventListener('play', () => {
+function onAudioPlay() {
   isPlaying = true;
   iconPlay.style.display = 'none';
   iconPause.style.display = 'block';
   miniIconPlay.style.display = 'none';
   miniIconPause.style.display = 'block';
-});
-audio.addEventListener('pause', () => {
+}
+function onAudioPause() {
   isPlaying = false;
   iconPlay.style.display = 'block';
   iconPause.style.display = 'none';
   miniIconPlay.style.display = 'block';
   miniIconPause.style.display = 'none';
-});
-
-audio.addEventListener('timeupdate', () => {
-  if (!audio.duration) return;
-  const pct = (audio.currentTime / audio.duration) * 100;
+}
+function onAudioTimeUpdate() {
+  const node = nodes[activeNode];
+  if (!node.duration) return;
+  const pct = (node.currentTime / node.duration) * 100;
   progressFill.style.transition = 'none';
   progressFill.style.width = pct + '%';
-  timeCur.textContent = fmt(audio.currentTime);
-});
-audio.addEventListener('loadedmetadata', () => {
-  timeTot.textContent = fmt(audio.duration);
-});
-
-audio.addEventListener('ended', () => {
+  timeCur.textContent = fmt(node.currentTime);
+  // Trigger crossfade when approaching end
+  if (!isCrossfading && node.duration - node.currentTime <= FADE_DURATION + 0.5) {
+    const hasNext = queueIdx < queue.length - 1 || repeatMode === 1;
+    if (hasNext) triggerCrossfade();
+  }
+}
+function onAudioMetadata() {
+  timeTot.textContent = fmt(nodes[activeNode].duration);
+}
+function onAudioEnded() {
   if (repeatMode === 2) {
     audio.currentTime = 0;
     audio.play();
     return;
   }
-  const hasNext = queueIdx < queue.length - 1;
-  if (hasNext || repeatMode === 1) {
-    nextTrack(true);
-  }
-});
+  if (!isCrossfading) nextTrack(true);
+}
+
+// Wire initial listeners
+attachNodeListeners(nodes[activeNode]);
 
 btnNext.addEventListener('click', () => nextTrack(false));
 btnPrev.addEventListener('click', () => {
-  if (audio.currentTime > 3) {
-    audio.currentTime = 0;
+  if (nodes[activeNode].currentTime > 3) {
+    nodes[activeNode].currentTime = 0;
   } else {
     if (queueIdx > 0) {
-      queueIdx--;
-      loadTrack(queue[queueIdx]);
-      audio.play();
+      const prevIdx = queue[queueIdx - 1];
+      loadTrack(prevIdx);
+      crossfadeTo(allTracks[prevIdx].url, () => {
+        attachNodeListeners(nodes[activeNode]);
+      });
     }
   }
 });
@@ -964,9 +1110,29 @@ function nextTrack(auto) {
     if (repeatMode === 1 || !auto) next = 0;
     else return;
   }
-  queueIdx = next;
-  loadTrack(queue[queueIdx]);
-  audio.play().catch(() => {});
+  const nextTrackIdx = queue[next];
+  loadTrack(nextTrackIdx);
+  crossfadeTo(allTracks[nextTrackIdx].url, () => {
+    attachNodeListeners(nodes[activeNode]);
+  });
+}
+
+// Called from timeupdate when we're FADE_DURATION seconds from end
+let crossfadeQueued = false;
+function triggerCrossfade() {
+  if (crossfadeQueued || isCrossfading) return;
+  crossfadeQueued = true;
+  let next = queueIdx + 1;
+  if (next >= queue.length) {
+    if (repeatMode === 1) next = 0;
+    else { crossfadeQueued = false; return; }
+  }
+  const nextTrackIdx = queue[next];
+  loadTrack(nextTrackIdx);
+  crossfadeTo(allTracks[nextTrackIdx].url, () => {
+    attachNodeListeners(nodes[activeNode]);
+    crossfadeQueued = false;
+  });
 }
 
 // ── SHUFFLE
@@ -997,8 +1163,9 @@ function seekTo(e) {
   const rect = progressBar.getBoundingClientRect();
   const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
   const pct = Math.max(0, Math.min(1, x / rect.width));
-  if (audio.duration) {
-    audio.currentTime = pct * audio.duration;
+  const node = nodes[activeNode];
+  if (node.duration) {
+    node.currentTime = pct * node.duration;
     progressFill.style.width = (pct * 100) + '%';
   }
 }
@@ -1039,7 +1206,6 @@ function renderLibrary() {
 }
 
 function playTrackFromList(realIdx, contextTracks) {
-  // Set queue to contextTracks indices, play realIdx
   const idxList = contextTracks.map(t => allTracks.indexOf(t));
   queue = idxList;
   queueIdx = idxList.indexOf(realIdx);
@@ -1050,7 +1216,7 @@ function playTrackFromList(realIdx, contextTracks) {
     queueIdx = queue.indexOf(cur);
   }
   loadTrack(realIdx);
-  audio.play().catch(() => {});
+  crossfadeTo(allTracks[realIdx].url, () => { attachNodeListeners(nodes[activeNode]); });
   renderQueue();
 }
 
@@ -1346,7 +1512,11 @@ function renderQueue() {
     row.className = 'queue-row' + (i === queueIdx ? ' current' : '');
     row.innerHTML = `<span class="qr-idx">${i + 1}</span><div class="qr-info"><div class="qr-title">${esc(t.title)}</div><div class="qr-artist">${esc(t.artist)}</div></div>`;
     const capturedI = i;
-    row.addEventListener('click', () => { queueIdx = capturedI; loadTrack(queue[capturedI]); audio.play().catch(() => {}); });
+    row.addEventListener('click', () => {
+      const ti = queue[capturedI];
+      loadTrack(ti);
+      crossfadeTo(allTracks[ti].url, () => { attachNodeListeners(nodes[activeNode]); });
+    });
     queueList.appendChild(row);
   }
 }
@@ -1369,13 +1539,65 @@ function showToast(msg) {
   toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
 }
 
+// ── LYRICS
+let lyricsOpen = false;
+const lyricsPanel = document.getElementById('lyrics-panel');
+const lyricsText = document.getElementById('lyrics-text');
+const lyricsStatus = document.getElementById('lyrics-status');
+const lyricsTrackEl = document.getElementById('lyrics-track');
+const btnLyrics = document.getElementById('btn-lyrics');
+const btnLyricsClose = document.getElementById('btn-lyrics-close');
+
+btnLyrics.addEventListener('click', () => {
+  lyricsOpen = true;
+  lyricsPanel.classList.add('visible');
+  btnLyrics.classList.add('on');
+  const t = allTracks[queue[queueIdx]];
+  if (t) fetchLyrics(t);
+});
+
+btnLyricsClose.addEventListener('click', () => {
+  lyricsOpen = false;
+  lyricsPanel.classList.remove('visible');
+  btnLyrics.classList.remove('on');
+});
+
+const lyricsCache = new Map();
+
+async function fetchLyrics(t) {
+  lyricsTrackEl.textContent = `${t.title} — ${t.artist}`;
+  const key = `${t.artist}||${t.title}`;
+  if (lyricsCache.has(key)) {
+    displayLyrics(lyricsCache.get(key));
+    return;
+  }
+  lyricsText.innerHTML = '<span id="lyrics-status">Fetching lyrics…</span>';
+  try {
+    const artist = encodeURIComponent(t.artist.replace(/\s*feat\.?.*/i, '').trim());
+    const title = encodeURIComponent(t.title.replace(/\s*[\(\[].*/g, '').trim());
+    const res = await fetch(`https://api.lyrics.ovh/v1/${artist}/${title}`);
+    if (!res.ok) throw new Error('not found');
+    const data = await res.json();
+    if (!data.lyrics) throw new Error('empty');
+    lyricsCache.set(key, data.lyrics);
+    displayLyrics(data.lyrics);
+  } catch (_) {
+    lyricsText.innerHTML = '<span id="lyrics-status">No lyrics found for this track</span>';
+  }
+}
+
+function displayLyrics(text) {
+  lyricsText.className = 'loaded';
+  lyricsText.textContent = text.trim();
+  document.getElementById('lyrics-body').scrollTop = 0;
+}
+
 // ── MEDIA SESSION
 if ('mediaSession' in navigator) {
   navigator.mediaSession.setActionHandler('play', () => { audio.play(); });
   navigator.mediaSession.setActionHandler('pause', () => { audio.pause(); });
   navigator.mediaSession.setActionHandler('previoustrack', () => btnPrev.click());
   navigator.mediaSession.setActionHandler('nexttrack', () => btnNext.click());
-  audio.addEventListener('play', updateMediaSession);
 }
 
 function updateMediaSession() {
